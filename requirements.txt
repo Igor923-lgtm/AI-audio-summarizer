@@ -7,3 +7,4 @@ pydub>=0.25.1
 audioop-lts>=0.2.2; python_version >= '3.13'
 aiofiles>=23.2.1
 edge-tts>=7.0.0
+ddgs>=9.0.0

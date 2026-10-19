@@ -153,11 +153,20 @@ class AIService:
             logger.error(f"Ошибка парсинга задачи: {e}")
             return None
 
-    async def chat(self, user_text: str, context: str = "") -> str:
-        """Свободная беседа: ответ ассистента с опциональным контекстом дел."""
+    async def chat(
+        self,
+        user_text: str,
+        context: str = "",
+        execute_tool=None,
+    ) -> str:
+        """Свободная беседа. Если дан execute_tool — работает агент-цикл (tools).
+
+        execute_tool: async (name: str, args: dict) -> str | список маркеров-инструментов.
+        Без инструментов — обычный ответ (как раньше).
+        """
         system_prompt = (
             "Ты — «Личный ИИ», ассистент Игоря в Telegram. Отвечай по-русски, живо и коротко "
-            "(до 10 абзацев, обычно 2-4), без канцелярита и без формальных заступов.\n"
+            "(обычно 2-4), без канцелярита и без формальных заступов.\n"
             "Если в контексте есть его реальные дела/заметки/задачи — можешь опираться на них, "
             "но не выдумывай факты, которых нет.\n"
             "Не навязывай помощь, не перечисляй свои функции, если не просят. Просто отвечай по делу."
@@ -165,19 +174,171 @@ class AIService:
         content = user_text
         if context:
             content = f"Контекст дел пользователя:\n{context}\n\nСообщение пользователя: {user_text}"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        if execute_tool is None:
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.error(f"Ошибка чата: {e}")
+                raise e
+
+        # --- агент-цикл с инструментами ---
+        tools = self._agent_tools()
+        system_prompt += (
+            "\n\nУ тебя есть инструменты. Зови их, когда нужно свежее или личное:\n"
+            "- web_search: новости, курсы, погода, что-то из интернета;\n"
+            "- search_notes: его личные заметки (планы, идеи, встречи);\n"
+            "- get_balance: его текущий финансовый баланс.\n"
+            "Сначала подумай, нужен ли инструмент. Если можешь ответить из головы или из "
+            "контекста дел — ответь сразу без вызова. После инструмента дай короткий вывод."
+        )
+        messages[0]["content"] = system_prompt
+
+        try:
+            for _ in range(4):  # максимум 4 итерации — против циклов
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.3,
+                )
+                msg = response.choices[0].message
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if not tool_calls:
+                    return (msg.content or "").strip()
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": msg.content or "",
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
+                )
+                for tc in tool_calls:
+                    name = tc.function.name
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except Exception:
+                        args = {}
+                    try:
+                        result = await execute_tool(name, args)
+                    except Exception as e:
+                        logger.error(f"Ошибка инструмента {name}: {e}")
+                        result = f"Ошибка инструмента {name}: {e}"
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": str(result)}
+                    )
+            # выжали все итерации — просим финальный ответ без инструментов
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.3,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.error(f"Ошибка чата-агента: {e}")
+            raise e
+
+    def _agent_tools(self) -> list[dict]:
+        """Схемы инструментов агента (OpenAI function-calling формат)."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": (
+                        "Поиск в интернете. Используй для свежих новостей, курсов валют, погоды, "
+                        "спортрезультатов, дат, любой информации, которой нет в твоей голове."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Поисковый запрос"}
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_notes",
+                    "description": (
+                        "Поиск по личным заметкам Игоря (его голосовые заметки, планы, идеи, встречи). "
+                        "Используй, когда вопрос о его делах."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Ключевые слова для поиска"}
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_balance",
+                    "description": "Текущий финансовый баланс Игоря за этот месяц (доходы/расходы/остаток).",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+
+    async def extract_fact(self, text: str) -> str | None:
+        """
+        Извлекает из реплики долговременный факт об Игоре (для памяти).
+        Возвращает одно короткое утверждение («Игорь живёт в Москве») или None,
+        если запоминать нечего (обычный вопрос/болтовня).
+        """
+        prompt = (
+            "Ты извлекатель фактов для личной памяти ассистента. Из реплики пользователя "
+            "выдели ОДИН долговременный факт о нём — короткое утверждение от третьего лица, "
+            "в настоящем времени, на русском («Игорь живёт в Москве», "
+            "«Игорь не любит кофе после 18:00», «У Игоря кот Барс»).\n"
+            "НЕ выдумывай: опирайся только на сказанное. Если это вопрос, просьба о действии "
+            "(«напомни…», «задача…»), вежливость или факт о ком-то другом — факта нет.\n"
+            "Ответ ТОЛЬКО JSON: {\"fact\": \"...\"} или {\"fact\": null}."
+        )
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content},
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": text},
                 ],
-                temperature=0.3,
+                temperature=0,
+                response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content.strip()
+            data = json.loads(response.choices[0].message.content.strip())
+            fact = str(data.get("fact") or "").strip()
+            return fact or None
         except Exception as e:
-            logger.error(f"Ошибка чата: {e}")
-            raise e
+            logger.error(f"Ошибка извлечения факта: {e}")
+            return None
 
     async def parse_finance(self, text: str, today_msk: str) -> dict | None:
         """

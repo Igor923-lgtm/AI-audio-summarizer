@@ -35,6 +35,8 @@ UPLOAD = [
     "app/ui.py",
     "app/tts.py",
     "app/kv.py",
+    "app/memory.py",
+    "app/tools_search.py",
     "requirements.txt",
     ".env.example",
     "README.md",

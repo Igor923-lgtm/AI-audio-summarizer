@@ -20,6 +20,8 @@ from app import tasks as tasks_db
 from app import kv
 from app import tts
 from app import ui
+from app import memory
+from app import tools_search
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +155,8 @@ def _help_text(on: bool) -> str:
         "⏰ <b>Напоминания</b> — «напомни завтра в 15:00 позвонить врачу», повторы: «каждый день...»\n"
         "✅ <b>Задачи</b> — «задача: сдать отчёт» → список с кнопкой «Готово»\n"
         "💸 <b>Финансы</b> — «потратил 500 на такси» → баланс и отчёт по категориям\n"
-        f"🔊 <b>Голосовые ответы</b> — сейчас: {'включены' if on else 'выключены'}\n\n"
+        f"🔊 <b>Голосовые ответы</b> — сейчас: {'включены' if on else 'выключены'}\n"
+        "🧠 <b>Память</b> — «запомни, что ...» → помню; «что ты помнишь?» → список\n\n"
         "💬 Просто напиши любое сообщение — поддержу беседу и отвечу на вопросы.\n"
         "Меню всегда внизу экрана."
     )
@@ -768,36 +771,100 @@ async def cmd_expenses(message: types.Message):
     await message.answer("\n".join(lines))
 
 
-async def _build_context(chat_id: int) -> str:
-    """Контекст дел для чата: свежие заметки, активные задачи, напоминания на сегодня."""
+async def _build_context(chat_id: int, query: str = "") -> str:
+    """Контекст для чата: факты, задачи, напоминания, заметки, история диалога."""
     parts: list[str] = []
-    files = _list_notes()[:5]
-    if files:
-        parts.append("Последние заметки:")
-        for path in files:
-            try:
-                with open(path, encoding="utf-8") as f:
-                    snippet = f.read()[:300].replace("\n", " ").strip()
-                parts.append(f"- {os.path.basename(path)}: {snippet}")
-            except Exception:
-                continue
+
+    facts = memory.facts_context(chat_id)
+    if facts:
+        parts.append(facts)
+
     tasks_rows = tasks_db.list_tasks(chat_id, done=False)
     if tasks_rows:
         parts.append("Активные задачи: " + "; ".join(t["text"] for t in tasks_rows[:5]))
+
     now = datetime.now(TZ_MSK)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     rems = reminders_db.get_today(chat_id, start, start + timedelta(days=1))
     if rems:
         parts.append("Напоминания на сегодня: " + "; ".join(r["text"] for r in rems[:5]))
+
+    # заметки: релевантные по запросу, иначе — 5 последних
+    note_lines: list[str] = []
+    if query:
+        for hit in memory.search_notes(NOTES_DIR, query, limit=3):
+            note_lines.append(f"- {os.path.basename(hit['path'])}: {hit['snippet'][:300]}")
+    if not note_lines:
+        for path in _list_notes()[:5]:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    note_lines.append(
+                        f"- {os.path.basename(path)}: {f.read()[:300].replace(chr(10), ' ').strip()}"
+                    )
+            except Exception:
+                continue
+    if note_lines:
+        parts.append("Заметки:\n" + "\n".join(note_lines))
+
+    hist = memory.history_context(chat_id, limit=12)
+    if hist:
+        parts.append(hist)
+
     return "\n".join(parts)
 
 
 # ---------- текст: напоминание / задача / финансы / чат ----------
 
+def _make_tool_executor(chat_id: int):
+    """Возвращает async-диспетчер инструментов агента, привязанный к чату."""
+
+    async def execute_tool(name: str, args: dict) -> str:
+        if name == "web_search":
+            return await tools_search.web_search(str(args.get("query", "")))
+        if name == "search_notes":
+            hits = memory.search_notes(NOTES_DIR, str(args.get("query", "")), limit=4)
+            if not hits:
+                return "В заметках ничего не нашлось."
+            return "\n".join(
+                f"- {os.path.basename(h['path'])}: {h['snippet'][:300]}" for h in hits
+            )
+        if name == "get_balance":
+            month = datetime.now(TZ_MSK).strftime("%Y-%m")
+            s = finance_db.month_summary(chat_id, month)
+            return (
+                f"Баланс за {month}: доходы {_money(s['income'])}, "
+                f"расходы {_money(s['expense'])}, остаток {_money(s['balance'])}"
+            )
+        return f"Неизвестный инструмент: {name}"
+
+    return execute_tool
+
+
 @dp.message(F.text & ~F.text.startswith("/"))
 async def text_handler(message: types.Message):
     text = (message.text or "").strip()
     if not text:
+        return
+
+    # --- память: «запомни ...» → факт; «что ты помнишь?» → список ---
+    m = re.match(r"^запомни(?:\s+что)?[,:]?\s+(.+)", text, re.IGNORECASE)
+    if m:
+        tail = m.group(1).strip()
+        try:
+            fact = await ai_service.extract_fact(tail) or tail
+        except Exception:
+            fact = tail
+        memory.add_fact(message.chat.id, fact)
+        await deliver(message, f"🧠 <b>Записал:</b> {ui.esc(fact)}")
+        return
+
+    if re.search(r"что (ты )?помнишь|что ты обо мне знаешь|мои факты", text, re.IGNORECASE):
+        facts = memory.list_facts(message.chat.id)
+        if facts:
+            body = "\n".join(f"• {ui.esc(f)}" for f in facts[:30])
+            await deliver(message, f"🧠 <b>Что помню ({len(facts)}):</b>\n{body}")
+        else:
+            await deliver(message, "Пока ничего не помню. Скажи, например, «запомни, что я живу в Москве».")
         return
 
     if re.search(r"напомни", text, re.IGNORECASE):
@@ -838,10 +905,14 @@ async def text_handler(message: types.Message):
             )
             return
 
-    # всё остальное — чат с ассистентом
+    # всё остальное — чат с ассистентом (агент: сам зовёт инструменты)
+    memory.add_dialog(message.chat.id, "user", text)
     try:
-        context = await _build_context(message.chat.id)
-        reply = await ai_service.chat(text, context)
+        context = await _build_context(message.chat.id, text)
+        reply = await ai_service.chat(
+            text, context, execute_tool=_make_tool_executor(message.chat.id)
+        )
+        memory.add_dialog(message.chat.id, "assistant", reply)
         await deliver(message, ui.esc(reply))
     except Exception as e:
         logger.error(f"Ошибка чата: {e}")

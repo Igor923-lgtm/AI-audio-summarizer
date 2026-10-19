@@ -13,6 +13,7 @@ os.makedirs(TEST_DIR + "/notes", exist_ok=True)
 os.environ["REMINDERS_DB"] = f"{TEST_DIR}/reminders.db"
 os.environ["FINANCE_DB"] = f"{TEST_DIR}/finance.db"
 os.environ["TASKS_DB"] = f"{TEST_DIR}/tasks.db"
+os.environ["MEMORY_DB"] = f"{TEST_DIR}/memory.db"
 os.environ["NOTES_DIR"] = f"{TEST_DIR}/notes"
 os.environ["TELEGRAM_BOT_TOKEN"] = "123:test"
 os.environ["GROQ_API_KEY"] = "gsk_test"
@@ -33,6 +34,7 @@ from app.bot import dp
 from app import reminders as R
 from app import tasks as T
 from app import finance as F
+from app import memory as MEM
 
 # ---- мок-бот ----
 # В aiogram 3.x шорткаты (message.answer) возвращают объект метода, который
@@ -79,6 +81,7 @@ B.ai_service.parse_finance = AsyncMock(
 )
 B.ai_service.structure_note = AsyncMock(return_value="# Тестовая заметка\n\n## Самое важное\n- всё хорошо\n\nТело.\n")
 B.ai_service.chat = AsyncMock(return_value="Привет! Я на связи.")
+B.ai_service.extract_fact = AsyncMock(return_value="Игорь живёт в Москве")
 
 USER = {"id": 1, "is_bot": False, "first_name": "Тест", "username": "tester"}
 CHAT = {"id": 1, "type": "private", "first_name": "Тест"}
@@ -169,6 +172,65 @@ async def main():
     await feed(msg_update("привет, расскажи шутку"))
     check("чат: ответ ассистента", "на связи" in last_text(), last_text()[:80])
     check("чат: вызов LLM", B.ai_service.chat.called)
+
+    # память: «запомни ...» → факт в БД + подтверждение
+    await feed(msg_update("запомни, что я живу в Москве", 90))
+    facts = MEM.list_facts(1)
+    check("память: факт сохранён", any("Москв" in f for f in facts), str(facts))
+    check("память: подтверждение", "записал" in last_text().lower(), last_text()[:80])
+
+    # память: «что ты помнишь?» → список фактов
+    await feed(msg_update("что ты помнишь?", 91))
+    check("память: ответ списком", "Москв" in last_text(), last_text()[:120])
+
+    # память: FTS-поиск по заметкам находит по слову (слово — в snippet, не в имени файла)
+    hits = MEM.search_notes(f"{TEST_DIR}/notes", "план", 3)
+    check(
+        "память: FTS находит заметку",
+        len(hits) > 0 and any("План" in h["snippet"] for h in hits),
+        str(hits)[:120],
+    )
+
+    # память: история диалога пишет chat-реплики (user + assistant)
+    hist = MEM.history_context(1, 20)
+    check("память: история диалога", "привет" in hist.lower() and "на связи" in hist.lower(), hist[:120])
+
+    # --- T3: диспетчер инструментов агента (офлайн) ---
+    exec_fn = B._make_tool_executor(1)
+    notes_res = await exec_fn("search_notes", {"query": "план"})
+    check("инстр: search_notes", "План" in notes_res or "note1" in notes_res, notes_res[:100])
+    bal_res = await exec_fn("get_balance", {})
+    check("инстр: get_balance", "баланс" in bal_res.lower() or "₽" in bal_res, bal_res[:100])
+    unk_res = await exec_fn("no_such_tool", {})
+    check("инстр: неизвестный отклонён", "неизвестный" in unk_res.lower(), unk_res[:80])
+
+    # --- T3: агент-цикл (мок LLM: tool_call → финальный ответ) ---
+    from types import SimpleNamespace
+    from app.ai_service import AIService
+
+    ai = AIService()
+    n_calls = {"n": 0}
+
+    async def fake_create(**kw):
+        n_calls["n"] += 1
+        if n_calls["n"] == 1:
+            tc = SimpleNamespace(id="t1", function=SimpleNamespace(name="get_balance", arguments="{}"))
+            msg = SimpleNamespace(content=None, tool_calls=[tc])
+        else:
+            msg = SimpleNamespace(content="Баланс: остаток +48300 ₽.", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    ai.client.chat.completions.create = fake_create
+    ran = []
+
+    async def fake_exec(name, args):
+        ran.append(name)
+        return "доходы +50000 ₽"
+
+    reply = await ai.chat("сколько у меня денег?", context="", execute_tool=fake_exec)
+    check("агент: инструмент вызван", ran == ["get_balance"], str(ran))
+    check("агент: финальный ответ", "баланс" in reply.lower(), reply[:80])
+    check("агент: ровно 2 итерации цикла", n_calls["n"] == 2, str(n_calls["n"]))
 
     # 4. Напоминания
     await feed(cb_update("ui:rem:today", 20))
