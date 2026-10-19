@@ -340,7 +340,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .bubble blockquote { border-left: 3px solid #a7b4c0; margin: 3px 0 3px 4px; padding: 1px 0 1px 8px; display: block; }
 .ikb { display: flex; flex-direction: column; gap: 4px; margin-top: 5px; }
 .ikb .ikrow { display: flex; gap: 4px; }
-.ikb button { flex: 1; background: #f2f3f5; border: none; border-radius: 8px; padding: 8px 6px; font-size: 14.5px; color: #3390ec; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ikb button { flex: 1 1 auto; background: #f2f3f5; border: none; border-radius: 8px; padding: 8px 6px; font-size: 14.5px; color: #3390ec; white-space: nowrap; }
 .rkb { background: #f1f1f4; border-top: 1px solid #d4d8dd; padding: 8px 6px 12px; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
 .rkb .rrow { display: flex; gap: 6px; }
 .rkb button { flex: 1; background: #fdfdfd; border: none; border-radius: 8px; min-height: 40px; font-size: 15px; color: #1c1c1e; box-shadow: 0 1px 1px rgba(0,0,0,.08); }
