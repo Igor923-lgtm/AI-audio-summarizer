@@ -102,6 +102,40 @@ def _money(amount: float) -> str:
     return f"{sign}{abs(amount):.0f} ₽"
 
 
+_MONTHS_NOM = [
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+]
+
+
+def _month_label(month: str) -> str:
+    """'2026-10' → 'октябрь 2026' (название месяца вместо ISO)."""
+    try:
+        y, m = month.split("-")
+        return f"{_MONTHS_NOM[int(m) - 1]} {y}"
+    except (ValueError, AttributeError, IndexError):
+        return month
+
+
+def _date_short(iso_date: str) -> str:
+    """'2026-10-19' → '19.10'."""
+    try:
+        return datetime.strptime(str(iso_date)[:10], "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        return str(iso_date)
+
+
+def _display_name(path: str) -> str:
+    """'2026-10-17_181500_Встреча_со_Светой.md' → 'Встреча со Светой.md'.
+
+    Убирает технический префикс времени (чтобы имя не ломалось посередине)
+    и делает подчёркивания пробелами. Сам файл не меняется — только подпись.
+    """
+    base = os.path.basename(path)
+    base = re.sub(r"^\d{4}-\d{2}-\d{2}_\d{6}_", "", base)
+    return base.replace("_", " ")
+
+
 def _repeat_label(rule: str | None) -> str:
     if not rule:
         return ""
@@ -286,7 +320,7 @@ async def _send_note_page(message: types.Message, files: list[str], idx: int):
     if len(html_text) > 4000:
         html_text = html_text[:4000] + "\n…"
     await message.answer(
-        f"{html_text}\n\n<i>{ui.esc(os.path.basename(path))}</i>",
+        f"{html_text}\n\n<i>{ui.esc(_display_name(path))}</i>",
         reply_markup=ui.note_pager_kb(idx, len(files)),
     )
 
@@ -315,7 +349,12 @@ async def cb_notes_search(call: types.CallbackQuery):
 
 async def _send_reminders(message: types.Message, rows, empty_text: str):
     if not rows:
-        await message.answer(empty_text)
+        await message.answer(
+            empty_text,
+            reply_markup=ui.inline(
+                [[("ℹ️ Как создать", "ui:rem:help"), ("🏠 Меню", "ui:menu")]]
+            ),
+        )
         return
     await message.answer(f"⏰ <b>Напоминания ({len(rows)})</b>")
     for r in rows:
@@ -399,7 +438,10 @@ async def cb_tasks_active(call: types.CallbackQuery):
     await call.answer()
     rows = tasks_db.list_tasks(call.from_user.id, done=False)
     if not rows:
-        await call.message.answer("Активных задач нет. Создай: «задача: ...»")
+        await call.message.answer(
+            "Активных задач нет. Создай: «задача: ...»",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
     for t in rows:
         await call.message.answer(
@@ -413,7 +455,10 @@ async def cb_tasks_done(call: types.CallbackQuery):
     await call.answer()
     rows = tasks_db.list_tasks(call.from_user.id, done=True)
     if not rows:
-        await call.message.answer("Сделанных задач пока нет.")
+        await call.message.answer(
+            "Сделанных задач пока нет.",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
     for t in rows:
         await call.message.answer(
@@ -452,7 +497,7 @@ async def cb_fin_balance(call: types.CallbackQuery):
     month = datetime.now(TZ_MSK).strftime("%Y-%m")
     s = finance_db.month_summary(call.from_user.id, month)
     await call.message.answer(
-        f"💰 <b>Баланс · {month}</b>\n\n"
+        f"💰 <b>Баланс · {_month_label(month)}</b>\n\n"
         f"Доходы:   <b>+{s['income']:.0f} ₽</b>\n"
         f"Расходы:  <b>−{s['expense']:.0f} ₽</b>\n"
         f"Остаток:  <b>{_money(s['balance'])}</b>"
@@ -465,9 +510,12 @@ async def cb_fin_report(call: types.CallbackQuery):
     month = datetime.now(TZ_MSK).strftime("%Y-%m")
     rows = finance_db.month_by_category(call.from_user.id, month)
     if not rows:
-        await call.message.answer(f"За {month} операций пока нет.")
+        await call.message.answer(
+            f"За {_month_label(month)} операций пока нет.",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
-    lines = [f"📊 <b>Категории · {month}</b>\n"]
+    lines = [f"📊 <b>Категории · {_month_label(month)}</b>\n"]
     for r in rows:
         if r["expense"] > 0:
             lines.append(f"• {ui.esc(r['category'])} — <b>−{r['expense']:.0f} ₽</b>")
@@ -481,12 +529,15 @@ async def cb_fin_list(call: types.CallbackQuery):
     await call.answer()
     rows = finance_db.recent(call.from_user.id, 10)
     if not rows:
-        await call.message.answer("Операций пока нет.")
+        await call.message.answer(
+            "Операций пока нет.",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
     lines = ["🧾 <b>Последние операции</b>\n"]
     for r in rows:
         comment = f" — {ui.esc(r['comment'])}" if r["comment"] else ""
-        lines.append(f"#{r['id']} {r['occurred_on']} · {_money(r['amount'])} · {ui.esc(r['category'])}{comment}")
+        lines.append(f"#{r['id']} {_date_short(r['occurred_on'])} · {_money(r['amount'])} · {ui.esc(r['category'])}{comment}")
     await call.message.answer("\n".join(lines))
 
 
@@ -733,7 +784,7 @@ async def cmd_balance(message: types.Message):
     month = datetime.now(TZ_MSK).strftime("%Y-%m")
     s = finance_db.month_summary(message.chat.id, month)
     await message.answer(
-        f"💰 <b>Баланс · {month}</b>\n\n"
+        f"💰 <b>Баланс · {_month_label(month)}</b>\n\n"
         f"Доходы:   <b>+{s['income']:.0f} ₽</b>\n"
         f"Расходы:  <b>−{s['expense']:.0f} ₽</b>\n"
         f"Остаток:  <b>{_money(s['balance'])}</b>"
@@ -746,9 +797,12 @@ async def cmd_report(message: types.Message):
     month = datetime.now(TZ_MSK).strftime("%Y-%m")
     rows = finance_db.month_by_category(message.chat.id, month)
     if not rows:
-        await message.answer(f"За {month} операций пока нет.")
+        await message.answer(
+            f"За {_month_label(month)} операций пока нет.",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
-    lines = [f"📊 <b>Категории · {month}</b>\n"]
+    lines = [f"📊 <b>Категории · {_month_label(month)}</b>\n"]
     for r in rows:
         if r["expense"] > 0:
             lines.append(f"• {ui.esc(r['category'])} — <b>−{r['expense']:.0f} ₽</b>")
@@ -764,11 +818,14 @@ async def cmd_expenses(message: types.Message):
         limit = max(1, min(int(parts[1]), 30))
     rows = finance_db.recent(message.chat.id, limit)
     if not rows:
-        await message.answer("Операций пока нет.")
+        await message.answer(
+            "Операций пока нет.",
+            reply_markup=ui.inline([[("🏠 Меню", "ui:menu")]]),
+        )
         return
     lines = [f"🧾 <b>Операции</b>\n"]
     for r in rows:
-        lines.append(f"#{r['id']} {r['occurred_on']} · {_money(r['amount'])} · {ui.esc(r['category'])}")
+        lines.append(f"#{r['id']} {_date_short(r['occurred_on'])} · {_money(r['amount'])} · {ui.esc(r['category'])}")
     await message.answer("\n".join(lines))
 
 

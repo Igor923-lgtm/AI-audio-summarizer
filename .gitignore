@@ -10,3 +10,5 @@ __pycache__/
 *.db
 *.db-journal
 qa/state/
+# генерируемый отчёт QA (пересоздаётся каждым прогоном run_qa.py)
+qa/REPORT.md

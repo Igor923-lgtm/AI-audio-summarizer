@@ -1,6 +1,7 @@
 """Интеграционный тест всех кнопок/handler'ов через aiogram feed_update с мок-ботом."""
 import asyncio
 import os
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -151,6 +152,8 @@ async def main():
     check("notes:last: заголовок", "План запуска" in last_text() or "🔖" in last_text(), last_text()[:120])
     check("notes:last: нет markdown-сырья", "##" not in last_text())
     check("notes:last: есть pager", getattr(last_method(), "reply_markup", None) is not None)
+    # T8: подпись файла без техпресификса времени (2026-10-.._120000_...)
+    check("T8: имя файла без timestamp", "120000" not in last_text(), last_text()[-60:])
 
     first_note_text = last_text()
     await feed(cb_update("ui:notes:next:1", 11))
@@ -306,6 +309,8 @@ async def main():
     # 4. Напоминания
     await feed(cb_update("ui:rem:today", 20))
     check("rem:today пусто", "нет" in last_text().lower(), last_text()[:80])
+    # T8: пустое состояние несёт кнопки-действия
+    check("T8: пустое — есть кнопки", getattr(last_method(), "reply_markup", None) is not None)
     await feed(cb_update("ui:rem:all", 21))
     check("rem:all пусто", "нет" in last_text().lower())
     await feed(cb_update("ui:rem:help", 22))
@@ -395,10 +400,14 @@ async def main():
     check("БД: операция", F.month_summary(1, "2026-10")["expense"] == 500)
     await feed(cb_update("ui:fin:balance", 51))
     check("fin:balance", "баланс" in last_text().lower() and "500" in last_text(), last_text()[:120])
+    # T8: месяц названием, а не ISO («октябрь 2026», не «2026-10»)
+    check("T8: месяц без ISO", not re.search(r"\d{4}-\d{2}", last_text()), last_text()[:80])
     await feed(cb_update("ui:fin:report", 52))
     check("fin:report", "такси" in last_text())
     await feed(cb_update("ui:fin:list", 53))
     check("fin:list", "такси" in last_text() or "#1" in last_text())
+    # T8: дата операции короткая («19.10», не «2026-10-19»)
+    check("T8: дата без ISO", not re.search(r"\d{4}-\d{2}-\d{2}", last_text()), last_text()[:80])
 
     # команды-алиасы
     await feed(msg_update("/баланс", 54))
