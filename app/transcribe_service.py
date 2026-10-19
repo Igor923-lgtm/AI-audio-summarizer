@@ -27,8 +27,8 @@ class TranscribeService:
                 transcription = await self.client.audio.transcriptions.create(
                     file=(os.path.basename(file_path), file.read()),
                     model=self.model,
-                    # Можна надати підказку для покращення розпізнавання українських термінів
-                    prompt="Стенограма робочої зустрічі, обговорення завдань, проектів, дедлайнів та планів.",
+                    # Подсказка улучшает распознавание русской речи и личных заметок
+                    prompt="Личная голосовая заметка: планы, идеи, задачи, мысли на русском языке.",
                     response_format="text"
                 )
             

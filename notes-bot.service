@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram voice notes bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/notes-bot
+ExecStart=/opt/notes-bot/venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

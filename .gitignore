@@ -1,6 +1,12 @@
 venv/
 .env
 downloads/
+notes/
 *.pyc
 __pycache__/
 *.log
+
+# runtime-состояние (настройки per-chat), не код
+*.db
+*.db-journal
+qa/state/

@@ -1,80 +1,127 @@
 import asyncio
 import logging
 import sys
-import os
-from aiohttp import web
-from aiogram import types
+from datetime import datetime, timedelta, timezone
 
-from app.bot import bot, dp
+from aiogram import Bot
 
-# Налаштовуємо красиве логування в консоль
+from app.bot import bot, dp, _fmt_when_msk, _repeat_label, ALLOWED_IDS
+from app import reminders as reminders_db
+from app import tasks as tasks_db
+from app import kv
+from app import tts
+from app import ui
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 logger = logging.getLogger(__name__)
 
-WEBHOOK_PATH = "/webhook"
+TZ_MSK = timezone(timedelta(hours=3))
 
-async def on_startup(app):
-    """Викликається при старті сервера."""
-    logger.info("Bot startup...")
-    # Render автоматично задає RENDER_EXTERNAL_URL (напр. https://my-bot.onrender.com)
-    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "")
-    if webhook_url:
-        full_url = f"{webhook_url}{WEBHOOK_PATH}"
-        logger.info(f"Встановлюю Webhook: {full_url}")
-        await bot.set_webhook(full_url)
+
+async def send_due_reminders(b: Bot):
+    now = datetime.now(timezone.utc)
+    for row in reminders_db.get_due(now):
+        try:
+            rule = row["repeat_rule"]
+            # закрываем текущее
+            if rule:
+                reminders_db.mark_sent(row["id"])
+                # пересчитываем следующий срок (row датa в UTC → MSK)
+                due_msk = datetime.fromisoformat(row["due_at"]).astimezone(TZ_MSK)
+                nxt = reminders_db.next_due(rule, due_msk)
+                if nxt:
+                    reminders_db.add_reminder(row["chat_id"], row["text"], nxt, rule)
+                    extra = _repeat_label(rule)
+                else:
+                    extra = ""
+            else:
+                reminders_db.complete(row["id"])
+                extra = ""
+            await b.send_message(
+                row["chat_id"],
+                f"⏰ <b>Напоминание</b>\n📌 {ui.esc(row['text'])}\n"
+                f"🗓 {_fmt_when_msk(row['due_at'])}{extra}",
+                reply_markup=ui.reminder_actions_kb(row["id"]),
+            )
+            logger.info(f"Напоминание #{row['id']} отправлено: {row['text']}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить напоминание #{row['id']}: {e}")
+
+
+async def send_digest_if_needed(b: Bot, chat_id: int):
+    """Утренняя сводка в 09:00 MSK, раз в день."""
+    now = datetime.now(TZ_MSK)
+    if now.hour < 9:
+        return
+    today_key = now.strftime("%Y-%m-%d")
+    state_path = "digest_state.txt"
+    try:
+        with open(state_path) as f:
+            if f.read().strip() == today_key:
+                return
+    except FileNotFoundError:
+        pass
+
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    rems = reminders_db.get_today(chat_id, start, end)
+    tasks = tasks_db.list_tasks(chat_id, done=False)
+
+    lines = [ui.card("Доброе утро", f"Сегодня {now.strftime('%d.%m')}:", "☀️")]
+    if rems:
+        lines.append(f"\n⏰ Напоминаний: <b>{len(rems)}</b>")
+        for r in rems[:5]:
+            lines.append(f"• {ui.esc(r['text'])} — {_fmt_when_msk(r['due_at'])}")
     else:
-        logger.warning("RENDER_EXTERNAL_URL не знайдено! Працюємо локально?")
+        lines.append("\n⏰ Напоминаний на сегодня нет")
+    if tasks:
+        lines.append(f"\n✅ Активных задач: <b>{len(tasks)}</b>")
+        for t in tasks[:5]:
+            lines.append(f"• {ui.esc(t['text'])}")
+    lines.append("\nХорошего дня! 🚀")
 
-async def on_shutdown(app):
-    """Викликається при вимкненні сервера."""
-    logger.info("Shutting down...")
-    await bot.session.close()
-
-async def delayed_processing(update: types.Update):
-    """Затримка гарантує, що aiohttp встигне віддати Telegram 200 OK до початку важких розрахунків."""
-    await asyncio.sleep(1)
     try:
-        await dp.feed_update(bot, update)
+        text = "\n".join(lines)
+        await b.send_message(chat_id, text, reply_markup=ui.main_kb())
+        if kv.voice_enabled(chat_id):
+            audio = await tts.synthesize(
+                f"Доброе утро. Напоминаний на сегодня: {len(rems)}. Активных задач: {len(tasks)}.",
+                kv.voice_key(chat_id),
+            )
+            if audio:
+                from aiogram import types
+
+                await b.send_voice(chat_id, types.BufferedInputFile(audio, filename="digest.mp3"))
+        with open(state_path, "w") as f:
+            f.write(today_key)
     except Exception as e:
-        logger.error(f"Помилка фонової обробки: {e}")
+        logger.error(f"Не удалось отправить сводку: {e}")
 
-async def handle_webhook(request):
-    """Обробник вебхуків від Telegram."""
-    try:
-        update_data = await request.json()
-        update = types.Update.model_validate(update_data, context={"bot": bot})
-        
-        # МАГІЯ: Відправляємо задачу у фон і не чекаємо її завершення!
-        asyncio.create_task(delayed_processing(update))
-    except Exception as e:
-        logger.error(f"Помилка валідації вебхука: {e}")
-        
-    # Миттєво віддаємо 200 OK, щоб Telegram не обірвав з'єднання
-    return web.Response(text="OK")
 
-async def healthcheck(request):
-    """Ендпоінт для перевірки 'здоров'я' сервісу (щоб Render бачив, що ми живі)."""
-    return web.Response(text="Bot is running and healthy!")
+async def reminder_loop(b: Bot):
+    while True:
+        try:
+            await send_due_reminders(b)
+            for uid in ALLOWED_IDS:
+                await send_digest_if_needed(b, uid)
+        except Exception as e:
+            logger.error(f"Ошибка цикла напоминаний: {e}")
+        await asyncio.sleep(20)
 
-def main():
-    app = web.Application()
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.router.add_get("/", healthcheck)  # Головна сторінка
-    
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    
-    # Render передає порт через змінну середовища PORT
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Запускаємо aiohttp сервер на порту {port}")
-    web.run_app(app, host="0.0.0.0", port=port)
+
+async def main():
+    logger.info("Запуск бота (long polling)...")
+    asyncio.create_task(reminder_loop(bot))
+    await dp.start_polling(bot, drop_pending_updates=False)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
