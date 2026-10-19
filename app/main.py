@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 
-from app.bot import bot, dp, _fmt_when_msk, _repeat_label, ALLOWED_IDS
+from app.bot import bot, dp, _fmt_when_msk, _repeat_label, ALLOWED_IDS, ai_service
 from app import reminders as reminders_db
 from app import tasks as tasks_db
 from app import kv
@@ -103,12 +103,46 @@ async def send_digest_if_needed(b: Bot, chat_id: int):
         logger.error(f"Не удалось отправить сводку: {e}")
 
 
+async def send_reflection_if_needed(b: Bot, chat_id: int):
+    """Еженедельный разбор: воскресенье 20:00 MSK, раз в неделю (ISO-неделя)."""
+    now = datetime.now(TZ_MSK)
+    if not (now.weekday() == 6 and now.hour == 20):  # 6 = воскресенье
+        return
+    week_key = now.strftime("%G-W%V")
+    state_path = "reflection_state.txt"
+    try:
+        with open(state_path) as f:
+            if f.read().strip() == week_key:
+                return
+    except FileNotFoundError:
+        pass
+
+    from app.reflection import build_reflection
+
+    text = await build_reflection(ai_service, chat_id)
+    if not text:
+        return  # мало данных или LLM упал — попробуем в следующую итерацию
+    try:
+        await b.send_message(
+            chat_id,
+            f"🧠 <b>Разбор недели</b>\n\n{ui.esc(text)}\n\n"
+            "Чтобы запомнить факт: «запомни, что …».\n"
+            "Чтобы правило заработало: добавь его в skills/*.md и задеплой.",
+        )
+        with open(state_path, "w") as f:
+            f.write(week_key)
+        logger.info(f"Рефлексия отправлена ({week_key})")
+    except Exception as e:
+        logger.error(f"Не удалось отправить рефлексию: {e}")
+
+
 async def reminder_loop(b: Bot):
     while True:
         try:
             await send_due_reminders(b)
             for uid in ALLOWED_IDS:
                 await send_digest_if_needed(b, uid)
+                await send_reflection_if_needed(b, uid)
         except Exception as e:
             logger.error(f"Ошибка цикла напоминаний: {e}")
         await asyncio.sleep(20)

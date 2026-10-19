@@ -22,6 +22,7 @@ from app import tts
 from app import ui
 from app import memory
 from app import tools_search
+from app import skills
 
 logger = logging.getLogger(__name__)
 
@@ -910,7 +911,10 @@ async def text_handler(message: types.Message):
     try:
         context = await _build_context(message.chat.id, text)
         reply = await ai_service.chat(
-            text, context, execute_tool=_make_tool_executor(message.chat.id)
+            text,
+            context,
+            execute_tool=_make_tool_executor(message.chat.id),
+            skills=skills.load_skills(),
         )
         memory.add_dialog(message.chat.id, "assistant", reply)
         await deliver(message, ui.esc(reply))

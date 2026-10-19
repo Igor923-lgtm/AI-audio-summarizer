@@ -276,6 +276,33 @@ async def main():
     finally:
         ai.client.chat.completions.create = real_create
 
+    # --- T5: скиллы (офлайн загрузчик) + рефлексия (мок LLM) ---
+    from app import skills as SK
+
+    # директория со скиллами: пишем тестовый .md во временную папку
+    sk_dir = f"{TEST_DIR}/skills"
+    os.makedirs(sk_dir, exist_ok=True)
+    with open(f"{sk_dir}/style.md", "w", encoding="utf-8") as f:
+        f.write("# Общение\n\n" + "Говори на ты, коротко и по делу, без канцелярита во всех ответах владельцу.\n" * 2)
+    loaded = SK.load_skills(sk_dir)
+    check("T5: скилл загружен", "Говори на ты" in loaded and "Правила владельца" in loaded, loaded[:80])
+    # пустая/несуществующая директория → ""
+    check("T5: нет скиллов → пусто", SK.load_skills(f"{TEST_DIR}/nope") == "")
+    # обрезка по лимиту не падает
+    check("T5: лимит соблюдён", len(SK.load_skills(sk_dir)) <= SK.MAX_TOTAL + 40, str(len(loaded)))
+
+    # рефлексия: мало истории → "" (без LLM)
+    from app import reflection as RF
+    empty_rf = await RF.build_reflection(ai, 99)  # чат 99 без истории
+    check("T5: рефлексия без истории → пусто", empty_rf == "", repr(empty_rf))
+    # рефлексия с данными → вызывает self_review (мокаем)
+    for i in range(8):
+        MEM.add_dialog(1, "user" if i % 2 == 0 else "assistant", f"реплика {i} о делах")
+    ai.self_review = AsyncMock(return_value="Слабых мест не нашёл. Правило: **отвечай коротко**.")
+    rf = await RF.build_reflection(ai, 1)
+    check("T5: рефлексия отработала", "правило" in rf.lower(), rf[:80])
+    check("T5: self_review вызван", ai.self_review.called)
+
     # 4. Напоминания
     await feed(cb_update("ui:rem:today", 20))
     check("rem:today пусто", "нет" in last_text().lower(), last_text()[:80])

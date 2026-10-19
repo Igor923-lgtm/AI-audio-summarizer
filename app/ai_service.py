@@ -201,10 +201,12 @@ class AIService:
         user_text: str,
         context: str = "",
         execute_tool=None,
+        skills: str = "",
     ) -> str:
         """Свободная беседа. Если дан execute_tool — работает агент-цикл (tools).
 
         execute_tool: async (name: str, args: dict) -> str | список маркеров-инструментов.
+        skills: текст скиллов (правила владельца), добавляется в system prompt.
         Без инструментов — обычный ответ (как раньше).
         """
         system_prompt = (
@@ -214,6 +216,8 @@ class AIService:
             "но не выдумывай факты, которых нет.\n"
             "Не навязывай помощь, не перечисляй свои функции, если не просят. Просто отвечай по делу."
         )
+        if skills:
+            system_prompt += "\n\n" + skills
         content = user_text
         if context:
             content = f"Контекст дел пользователя:\n{context}\n\nСообщение пользователя: {user_text}"
@@ -346,6 +350,27 @@ class AIService:
                 },
             },
         ]
+
+    async def self_review(self, dialog: str, facts: str) -> str:
+        """Еженедельный честный разбор своих ответов (для рефлексии)."""
+        prompt = (
+            "Ты — личный ассистент Игоря, делаешь краткий еженедельный разбор своих ответов.\n"
+            "Ниже: факты о нём и последние реплики диалога. Дай разбор до 10 строк:\n"
+            "1. Новые факты об Игоре, которые стоит запомнить (2–3; если их нет — опусти этот пункт).\n"
+            "2. Где твои ответы были слабыми, излишне длинными или по-канцеляриту (1–2, честно; "
+            "если не нашёл — «слабых мест не нашёл»).\n"
+            "3. Одно правило (скилл) в виде markdown-абзаца, улучшившее бы ответы.\n"
+            "Только текст разбора, без вступлений, по-русски."
+        )
+        user = f"ФАКТЫ ОБ ИГОРЕ:\n{facts}\n\nПОСЛЕДНИЕ РЕПЛИКИ:\n{dialog}"
+        response = await self._complete(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+        )
+        return (response.choices[0].message.content or "").strip()
 
 
     async def extract_fact(self, text: str) -> str | None:
