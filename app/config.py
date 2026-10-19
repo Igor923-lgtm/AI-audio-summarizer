@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     # Telegram ID владельцев через запятую; пустая строка — whitelist отключён
     allowed_user_ids: str = ""
     notes_dir: str = "notes"
+    # LLM-модели через запятую: первая — основная, остальные — fallback при ошибке/429
+    llm_models: str = "openai/gpt-oss-120b,openai/gpt-oss-20b"
 
     model_config = SettingsConfigDict(
         env_file=".env",

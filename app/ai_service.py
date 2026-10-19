@@ -15,7 +15,53 @@ class AIService:
 
     def __init__(self):
         self.client = AsyncGroq(api_key=settings.groq_api_key.get_secret_value())
-        self.model = "openai/gpt-oss-120b"
+        # Упорядоченный список моделей: первая основная, остальные — fallback
+        self.models = [m.strip() for m in settings.llm_models.split(",") if m.strip()]
+        if not self.models:
+            self.models = ["openai/gpt-oss-120b"]
+        self.model = self.models[0]  # основная (для обратной совместимости)
+
+    async def _complete(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float = 0.3,
+        response_format: dict | None = None,
+        tools: list | None = None,
+        tool_choice=None,
+        max_tokens: int | None = None,
+    ):
+        """LLM-вызов с fallback по списку моделей.
+
+        Пробует модели по очереди; при любой ошибке (429, 5xx, модель удалена…)
+        переключается на следующую. Логирует, какая ответила. Все упали → raise.
+        """
+        last_err: Exception | None = None
+        for idx, model in enumerate(self.models):
+            kwargs: dict = {"model": model, "messages": messages, "temperature": temperature}
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            if tools is not None:
+                kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            try:
+                resp = await self.client.chat.completions.create(**kwargs)
+                if idx > 0:
+                    logger.warning(
+                        f"LLM fallback: ответила {model} (основная {self.models[0]} не ответила)"
+                    )
+                return resp
+            except Exception as e:
+                last_err = e
+                if idx < len(self.models) - 1:
+                    logger.warning(f"LLM {model} упала, пробую fallback: {e}")
+                else:
+                    logger.error(f"LLM {model} упала (последняя): {e}")
+                continue
+        raise last_err if last_err else RuntimeError("Нет доступных LLM-моделей")
 
     async def structure_note(self, transcript: str) -> str:
         """
@@ -60,8 +106,7 @@ class AIService:
         user_content = f"Стенограмма голосовой заметки:\n\n{transcript}"
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -102,8 +147,7 @@ class AIService:
         )
         user_content = f"Сейчас в Москве (Europe/Moscow): {now_moscow.strftime('%Y-%m-%d %H:%M, %A')}\n\nТекст: {text}"
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content},
@@ -135,8 +179,7 @@ class AIService:
             "text — коротко, без «задача:», на русском. Ответ ТОЛЬКО JSON."
         )
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": text},
@@ -182,8 +225,7 @@ class AIService:
 
         if execute_tool is None:
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
+                response = await self._complete(
                     messages=messages,
                     temperature=0.3,
                 )
@@ -206,8 +248,7 @@ class AIService:
 
         try:
             for _ in range(4):  # максимум 4 итерации — против циклов
-                response = await self.client.chat.completions.create(
-                    model=self.model,
+                response = await self._complete(
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
@@ -250,8 +291,7 @@ class AIService:
                         {"role": "tool", "tool_call_id": tc.id, "content": str(result)}
                     )
             # выжали все итерации — просим финальный ответ без инструментов
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=messages,
                 temperature=0.3,
             )
@@ -324,8 +364,7 @@ class AIService:
             "Ответ ТОЛЬКО JSON: {\"fact\": \"...\"} или {\"fact\": null}."
         )
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": text},
@@ -360,8 +399,7 @@ class AIService:
         )
         user_content = f"Сегодня в Москве: {today_msk}\n\nТекст: {text}"
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._complete(
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_content},

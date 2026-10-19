@@ -232,6 +232,50 @@ async def main():
     check("агент: финальный ответ", "баланс" in reply.lower(), reply[:80])
     check("агент: ровно 2 итерации цикла", n_calls["n"] == 2, str(n_calls["n"]))
 
+    # --- T4: fallback моделей (основная падает → отвечает запасная) ---
+    # ai.models == [primary, fallback] из config; мокаем create:
+    # primary кидает исключение, fallback отвечает.
+    seen_models = []
+
+    async def flaky_create(**kw):
+        seen_models.append(kw["model"])
+        if kw["model"] == ai.models[0]:  # основная — «сломана»
+            raise RuntimeError("429 rate limited")
+        # запасная — отдаёт валидный ответ
+        msg = SimpleNamespace(content="ок с запасной", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    real_create = ai.client.chat.completions.create
+    ai.client.chat.completions.create = flaky_create
+    try:
+        resp = await ai._complete([{"role": "user", "content": "тест"}])
+        check("T4: fallback переключил модель", len(seen_models) == 2, str(seen_models))
+        check("T4: ответила запасная", "запасной" in resp.choices[0].message.content, resp.choices[0].message.content)
+
+        # обе модели работают → только одна попытка (fallback не нужен)
+        async def all_ok(**kw):
+            seen_models.append(kw["model"])
+            msg = SimpleNamespace(content="ок с основной", tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+        seen_models.clear()
+        ai.client.chat.completions.create = all_ok
+        await ai._complete([{"role": "user", "content": "тест"}])
+        check("T4: без сбоя — одна попытка", len(seen_models) == 1, str(seen_models))
+
+        # обе падают → исключение
+        async def all_fail(**kw):
+            seen_models.append(kw["model"])
+            raise RuntimeError("500")
+        ai.client.chat.completions.create = all_fail
+        try:
+            await ai._complete([{"role": "user", "content": "x"}])
+            check("T4: все модели упали → raise", False, "не поднял")
+        except RuntimeError:
+            check("T4: все модели упали → raise", True)
+    finally:
+        ai.client.chat.completions.create = real_create
+
     # 4. Напоминания
     await feed(cb_update("ui:rem:today", 20))
     check("rem:today пусто", "нет" in last_text().lower(), last_text()[:80])
