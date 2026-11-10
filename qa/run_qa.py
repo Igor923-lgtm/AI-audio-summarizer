@@ -117,7 +117,10 @@ def capture() -> list[dict]:
     from app import finance as F
 
     for name, body in NOTES:
-        with open(os.path.join(NOTES_DIR, name), "w", encoding="utf-8") as f:
+        # заметки chat_id=1 (USER1) — персональная папка
+        user_notes = os.path.join(NOTES_DIR, "1")
+        os.makedirs(user_notes, exist_ok=True)
+        with open(os.path.join(user_notes, name), "w", encoding="utf-8") as f:
             f.write(body)
 
     mock_bot = AsyncMock(spec=Bot)

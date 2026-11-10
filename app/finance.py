@@ -1,25 +1,35 @@
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.environ.get("FINANCE_DB", "finance.db")
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("FINANCE_DB", os.path.join(_BASE, "finance.db"))
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS finance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            comment TEXT,
-            occurred_on TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )"""
-    )
-    return conn
+@contextmanager
+def _connect():
+    """with _connect() as conn: — закрывает соединение (иначе утечка FD)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS finance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                comment TEXT,
+                occurred_on TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_operation(chat_id: int, amount: float, category: str, comment: str, occurred_on: str) -> int:

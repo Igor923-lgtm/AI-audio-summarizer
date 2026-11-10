@@ -1,13 +1,15 @@
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 
-from app.bot import bot, dp, _fmt_when_msk, _repeat_label, ALLOWED_IDS, ai_service
+from app.bot import bot, dp, _fmt_when_msk, _repeat_label, ALLOWED_IDS, ai_service, _list_notes
 from app import reminders as reminders_db
 from app import tasks as tasks_db
+from app import memory
 from app import kv
 from app import tts
 from app import ui
@@ -54,9 +56,9 @@ async def send_due_reminders(b: Bot):
 
 
 async def send_digest_if_needed(b: Bot, chat_id: int):
-    """Утренняя сводка в 09:00 MSK, раз в день."""
+    """Утренняя сводка в 10:00 MSK, раз в день."""
     now = datetime.now(TZ_MSK)
-    if now.hour < 9:
+    if now.hour < 10:
         return
     today_key = now.strftime("%Y-%m-%d")
     state_path = "digest_state.txt"
@@ -73,6 +75,40 @@ async def send_digest_if_needed(b: Bot, chat_id: int):
     tasks = tasks_db.list_tasks(chat_id, done=False)
 
     lines = [ui.card("Доброе утро", f"Сегодня {now.strftime('%d.%m')}:", "☀️")]
+
+    # одна живая строка «главное» от LLM (без погоды); при сбое — просто опускаем
+    try:
+        facts = memory.list_facts(chat_id, 12)
+        note_bits: list[str] = []
+        # только свежие заметки (48ч) — старые не должны звучать как «сегодня»
+        fresh_cutoff = now.timestamp() - 48 * 3600
+        for path in _list_notes(chat_id):
+            try:
+                if os.path.getmtime(path) < fresh_cutoff:
+                    continue
+                with open(path, encoding="utf-8") as f:
+                    note_bits.append(f.read()[:200].replace("\n", " ").strip())
+            except Exception:
+                continue
+            if len(note_bits) >= 2:
+                break
+        rem_txt = "; ".join(f"{r['text']} ({_fmt_when_msk(r['due_at'])})" for r in rems[:5]) or "нет"
+        task_txt = "; ".join(t["text"] for t in tasks[:5]) or "нет"
+        fact_txt = "; ".join(facts[:8]) or "нет"
+        brief = await ai_service.chat(
+            "Одно короткое предложение по-русски: что для пользователя главное сегодня. "
+            "Живо, без «вот список», без канцелярита. Если данных почти нет — одно дружелюбное пожелание.\n"
+            f"Напоминания: {rem_txt}\nЗадачи: {task_txt}\nФакты: {fact_txt}\n"
+            f"Заметки: {'; '.join(note_bits) or 'нет'}",
+            skills="",
+            user_name="Игорь",
+        )
+        brief = (brief or "").strip().replace("\n", " ")[:200]
+        if brief:
+            lines.append(f"\n💡 {ui.esc(brief)}")
+    except Exception as e:
+        logger.warning(f"Сводка: AI-строка не удалась: {e}")
+
     if rems:
         lines.append(f"\n⏰ Напоминаний: <b>{len(rems)}</b>")
         for r in rems[:5]:

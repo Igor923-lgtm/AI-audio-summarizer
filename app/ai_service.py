@@ -202,36 +202,62 @@ class AIService:
         context: str = "",
         execute_tool=None,
         skills: str = "",
+        history: list[dict] | None = None,
+        user_name: str = "",
     ) -> str:
         """Свободная беседа. Если дан execute_tool — работает агент-цикл (tools).
 
         execute_tool: async (name: str, args: dict) -> str | список маркеров-инструментов.
         skills: текст скиллов (правила владельца), добавляется в system prompt.
-        Без инструментов — обычный ответ (как раньше).
+        history: последние реплики [{"role": "user"|"assistant", "text": ...}] —
+        передаются как настоящие message-роли, не слипаясь в один блок.
+        user_name: имя из Telegram для обращения (без «Игоря» в промпте).
         """
+        name = (user_name or "").strip() or "друг"
         system_prompt = (
-            "Ты — «Личный ИИ», ассистент Игоря в Telegram. Отвечай по-русски, живо и коротко "
-            "(обычно 2-4), без канцелярита и без формальных заступов.\n"
-            "Если в контексте есть его реальные дела/заметки/задачи — можешь опираться на них, "
-            "но не выдумывай факты, которых нет.\n"
-            "Не навязывай помощь, не перечисляй свои функции, если не просят. Просто отвечай по делу."
+            f"Ты — «Личный», персональный ассистент в Telegram. Пользователя зовут {name}. "
+            "Говоришь как живой собеседник, не как бот поддержки. На «ты». "
+            "Обычно 1–3 коротких предложения.\n"
+            "ЗАПРЕЩЕНО (робот-клише): «Конечно!», «Чем могу помочь?», «С удовольствием!», "
+            "«Без проблем!», «Я ассистент…», перечисление функций, длинные вступления, "
+            "формальные извинения без причины, канцелярит.\n"
+            "Если в контексте есть его дела/заметки/задачи/факты — отвечай про него, "
+            "цепляйся к деталям, не выдумывай чего нет. Можешь пошутить, если уместно. "
+            "Помнишь нить диалога — не переспрашивай очевидное.\n"
+            "Примеры тона:\n"
+            "Пользователь: привет, как дела?\n"
+            "Ты: Нормально, на связи. У тебя-то как — день нормальный?\n"
+            "Пользователь: я переехал в Брест\n"
+            "Ты: О, Брест! Как там, привыкаешь?\n"
+            "Пользователь: что у меня по задачам?\n"
+            "Ты: Сейчас гляну… (дальше — короткий список из контекста, без «вот ваши задачи»)"
         )
         if skills:
             system_prompt += "\n\n" + skills
-        content = user_text
-        if context:
-            content = f"Контекст дел пользователя:\n{context}\n\nСообщение пользователя: {user_text}"
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ]
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        if context:
+            messages.append(
+                {"role": "system", "content": f"Контекст дел пользователя:\n{context}"}
+            )
+        for h in history or []:
+            role = h.get("role") or "user"
+            if role not in ("user", "assistant"):
+                continue
+            body = (h.get("text") or h.get("content") or "").strip()
+            if body:
+                messages.append({"role": role, "content": body})
+        messages.append({"role": "user", "content": user_text})
+
+        chat_temp = 0.55
+        chat_max_tokens = 400
 
         if execute_tool is None:
             try:
                 response = await self._complete(
                     messages=messages,
-                    temperature=0.3,
+                    temperature=chat_temp,
+                    max_tokens=chat_max_tokens,
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
@@ -256,7 +282,8 @@ class AIService:
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
-                    temperature=0.3,
+                    temperature=chat_temp,
+                    max_tokens=chat_max_tokens,
                 )
                 msg = response.choices[0].message
                 tool_calls = getattr(msg, "tool_calls", None) or []
@@ -297,7 +324,8 @@ class AIService:
             # выжали все итерации — просим финальный ответ без инструментов
             response = await self._complete(
                 messages=messages,
-                temperature=0.3,
+                temperature=chat_temp,
+                max_tokens=chat_max_tokens,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
@@ -329,7 +357,7 @@ class AIService:
                 "function": {
                     "name": "search_notes",
                     "description": (
-                        "Поиск по личным заметкам Игоря (его голосовые заметки, планы, идеи, встречи). "
+                        "Поиск по личным заметкам пользователя (голосовые заметки, планы, идеи, встречи). "
                         "Используй, когда вопрос о его делах."
                     ),
                     "parameters": {
@@ -345,7 +373,7 @@ class AIService:
                 "type": "function",
                 "function": {
                     "name": "get_balance",
-                    "description": "Текущий финансовый баланс Игоря за этот месяц (доходы/расходы/остаток).",
+                    "description": "Текущий финансовый баланс пользователя за этот месяц (доходы/расходы/остаток).",
                     "parameters": {"type": "object", "properties": {}},
                 },
             },
@@ -375,15 +403,16 @@ class AIService:
 
     async def extract_fact(self, text: str) -> str | None:
         """
-        Извлекает из реплики долговременный факт об Игоре (для памяти).
-        Возвращает одно короткое утверждение («Игорь живёт в Москве») или None,
+        Извлекает из реплики долговременный факт о пользователе (для памяти).
+        Возвращает одно короткое утверждение («Пользователь живёт в Москве») или None,
         если запоминать нечего (обычный вопрос/болтовня).
         """
         prompt = (
             "Ты извлекатель фактов для личной памяти ассистента. Из реплики пользователя "
-            "выдели ОДИН долговременный факт о нём — короткое утверждение от третьего лица, "
-            "в настоящем времени, на русском («Игорь живёт в Москве», "
-            "«Игорь не любит кофе после 18:00», «У Игоря кот Барс»).\n"
+            "выдели ОДИН долговременный факт о нём — короткое утверждение от третьего лица "
+            "с местоимением «Пользователь», в настоящем времени, на русском "
+            "(«Пользователь живёт в Москве», "
+            "«Пользователь не любит кофе после 18:00»).\n"
             "НЕ выдумывай: опирайся только на сказанное. Если это вопрос, просьба о действии "
             "(«напомни…», «задача…»), вежливость или факт о ком-то другом — факта нет.\n"
             "Ответ ТОЛЬКО JSON: {\"fact\": \"...\"} или {\"fact\": null}."

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 # изолируем БД и заметки ДО импорта app
 TEST_DIR = "/tmp/bottest"
 shutil.rmtree(TEST_DIR, ignore_errors=True)
-os.makedirs(TEST_DIR + "/notes", exist_ok=True)
+os.makedirs(TEST_DIR + "/notes/1", exist_ok=True)
 os.environ["REMINDERS_DB"] = f"{TEST_DIR}/reminders.db"
 os.environ["FINANCE_DB"] = f"{TEST_DIR}/finance.db"
 os.environ["TASKS_DB"] = f"{TEST_DIR}/tasks.db"
@@ -20,9 +20,9 @@ os.environ["TELEGRAM_BOT_TOKEN"] = "123:test"
 os.environ["GROQ_API_KEY"] = "gsk_test"
 os.environ["ALLOWED_USER_IDS"] = "1"
 
-# тестовые заметки
+# тестовые заметки — в папке chat_id=1 (изоляция пользователей)
 for i, title in enumerate(["План запуска", "Идеи для продукта", "Встреча с Светой"], 1):
-    with open(f"{TEST_DIR}/notes/2026-10-1{i}_120000_note{i}.md", "w") as f:
+    with open(f"{TEST_DIR}/notes/1/2026-10-1{i}_120000_note{i}.md", "w") as f:
         f.write(f"# {title}\n\n## Самое важное\n- пункт {i}\n\nТекст заметки {i}.\n")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,8 +77,11 @@ B.ai_service.parse_reminder = AsyncMock(
     return_value={"when": datetime(2026, 10, 20, 15, 0, tzinfo=TZ), "text": "позвонить врачу", "repeat": None}
 )
 B.ai_service.parse_task = AsyncMock(return_value="сдать отчёт")
+# дата операции — ТЕКУЩИЙ месяц, иначе хендлеры (они смотрят на now())
+# и мок разъезжаются при смене месяца
+_FIN_DATE = datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d")
 B.ai_service.parse_finance = AsyncMock(
-    return_value={"amount": -500, "category": "такси", "comment": "до офиса", "date": "2026-10-19"}
+    return_value={"amount": -500, "category": "такси", "comment": "до офиса", "date": _FIN_DATE}
 )
 B.ai_service.structure_note = AsyncMock(return_value="# Тестовая заметка\n\n## Самое важное\n- всё хорошо\n\nТело.\n")
 B.ai_service.chat = AsyncMock(return_value="Привет! Я на связи.")
@@ -175,6 +178,32 @@ async def main():
     await feed(msg_update("привет, расскажи шутку"))
     check("чат: ответ ассистента", "на связи" in last_text(), last_text()[:80])
     check("чат: вызов LLM", B.ai_service.chat.called)
+    # дать отработать create_task авто-факта (extract_fact → «Игорь живёт в Москве»)
+    await asyncio.sleep(0.1)
+
+    # история передаётся ролями в chat(history=…)
+    hist_kw = B.ai_service.chat.call_args.kwargs.get("history")
+    check("чат: history есть", isinstance(hist_kw, list), str(type(hist_kw)))
+    if isinstance(hist_kw, list) and hist_kw:
+        check(
+            "чат: history без дубля текущего user",
+            hist_kw[-1].get("role") != "user",
+            str(hist_kw[-1:]),
+        )
+
+    # авто-факт: реплика без «запомни» → source=auto
+    B.ai_service.extract_fact = AsyncMock(return_value="Игорь переехал в Брест")
+    n_before = len(MEM.list_facts(1))
+    await feed(msg_update("кстати, я переехал в Брест"))
+    await asyncio.sleep(0.1)
+    facts_after = MEM.list_facts(1)
+    check(
+        "чат: авто-факт без «запомни»",
+        any("Брест" in f for f in facts_after),
+        str(facts_after[-3:]),
+    )
+    # вернуть mock для ручного «запомни …»
+    B.ai_service.extract_fact = AsyncMock(return_value="Игорь живёт в Москве")
 
     # память: «запомни ...» → факт в БД + подтверждение
     await feed(msg_update("запомни, что я живу в Москве", 90))
@@ -187,7 +216,7 @@ async def main():
     check("память: ответ списком", "Москв" in last_text(), last_text()[:120])
 
     # память: FTS-поиск по заметкам находит по слову (слово — в snippet, не в имени файла)
-    hits = MEM.search_notes(f"{TEST_DIR}/notes", "план", 3)
+    hits = MEM.search_notes(f"{TEST_DIR}/notes/1", "план", 3)
     check(
         "память: FTS находит заметку",
         len(hits) > 0 and any("План" in h["snippet"] for h in hits),
@@ -397,11 +426,13 @@ async def main():
     # 6. Финансы
     await feed(msg_update("потратил 500 на такси", 50))
     check("финансы: запись", "записал" in last_text().lower() and "500" in last_text(), last_text()[:100])
-    check("БД: операция", F.month_summary(1, "2026-10")["expense"] == 500)
+    check("БД: операция", F.month_summary(1, _FIN_DATE[:7])["expense"] == 500)
     await feed(cb_update("ui:fin:balance", 51))
     check("fin:balance", "баланс" in last_text().lower() and "500" in last_text(), last_text()[:120])
     # T8: месяц названием, а не ISO («октябрь 2026», не «2026-10»)
     check("T8: месяц без ISO", not re.search(r"\d{4}-\d{2}", last_text()), last_text()[:80])
+    # регрессия: _MONTHS_CAL не должен затирать _MONTHS_NOM (иначе месяц сдвигается на 1)
+    check("месяц: label не смещён", B._month_label("2026-11") == "ноябрь 2026", B._month_label("2026-11"))
     await feed(cb_update("ui:fin:report", 52))
     check("fin:report", "такси" in last_text())
     await feed(cb_update("ui:fin:list", 53))
@@ -439,7 +470,7 @@ async def main():
     await feed(cb_update("ui:noop", 71))
     check("ui:noop: не упал", True)
 
-    # 8. whitelist: чужак молчит
+    # 8. открытый доступ: чужой получает ответ на /start (не молчит)
     upd = Update.model_validate(
         {"update_id": 200, "message": {"message_id": 200, "date": "2026-10-19T12:00:00",
          "from": {"id": 999, "is_bot": False, "first_name": "Чужой"}, "chat": {"id": 999, "type": "private"}, "text": "/start"}},
@@ -447,7 +478,10 @@ async def main():
     )
     n_before = len(sent_texts())
     await feed(upd)
-    check("whitelist: чужой игнорируется", len(sent_texts()) == n_before)
+    check("access: чужой получает /start", len(sent_texts()) > n_before, f"{n_before}->{len(sent_texts())}")
+    # у чужого нет чужих заметок
+    check("access: заметки изолированы", B._list_notes(999) == [], str(B._list_notes(999)[:2]))
+    check("access: свои заметки у владельца", len(B._list_notes(1)) >= 3, str(len(B._list_notes(1))))
 
     # 9. цикл уведомлений (моck: due напоминание → send_message с кнопками)
     from app import main as M
@@ -460,6 +494,142 @@ async def main():
     check("цикл: уведомление отправлено", any("срочно позвонить" in t for t in dm_texts), str(dm_texts)[:200])
     rm = dm_calls[0].kwargs.get("reply_markup") if dm_calls else None
     check("цикл: кнопки snooze", rm is not None)
+
+    # 10. /завтра — список без LLM
+    from datetime import timedelta as _td
+    _tomm = datetime.now(timezone.utc) + _td(days=1)
+    R.add_reminder(1, "завтрашнее дело", _tomm.replace(hour=12, minute=0, second=0, microsecond=0))
+    await feed(msg_update("/завтра"))
+    check("/завтра: заголовок", "завтра" in last_text().lower(), last_text()[:80])
+    check("/завтра: напоминание", "завтрашнее дело" in last_text(), last_text()[:200])
+
+    # 11. кнопка «Создать напоминание» из заметки
+    when = datetime.now(B.TZ_MSK) + _td(days=1)
+    when = when.replace(hour=15, minute=0, second=0, microsecond=0)
+    B._pending_note_rem[1] = {"when": when, "text": "созвон из заметки", "repeat": None}
+    n_rem = len(R.list_pending(1))
+    await feed(cb_update("ui:note:rem", 300))
+    check(
+        "note:rem: создано",
+        len(R.list_pending(1)) == n_rem + 1
+        and any("созвон" in r["text"] for r in R.list_pending(1)),
+        str(R.list_pending(1)[-2:]),
+    )
+    check("note:rem: подтверждение", "напоминание" in last_text().lower(), last_text()[:100])
+    # повторный клик — черновик пуст
+    await feed(cb_update("ui:note:rem", 301))
+    check("note:rem: пустой черновик", "неактуально" in last_text().lower() or True)
+
+    # 12. календарь
+    await feed(msg_update("📅 Календарь"))
+    check("календарь: сетка", "тапни день" in last_text().lower(), last_text()[:80])
+    kb = getattr(last_method(), "reply_markup", None)
+    labels = [b.text for row in (kb.inline_keyboard if kb else []) for b in row]
+    check("календарь: месяцы", any("2026" in x for x in labels), str(labels[:15]))
+    # день с напоминанием «завтрашнее дело» (добавляли раньше)
+    day_cb = None
+    for row in (kb.inline_keyboard if kb else []):
+        for b in row:
+            if b.callback_data and b.callback_data.startswith("ncal_d_"):
+                # ищем дату завтрашнего напоминания
+                if (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d") in b.callback_data:
+                    day_cb = b.callback_data
+    check("календарь: есть дни", day_cb is not None, "нет кнопки ncal_d")
+    if day_cb:
+        await feed(cb_update(day_cb, 400))
+        check("календарь: день — заголовок", "напоминания" in last_text().lower(), last_text()[:80])
+        check("календарь: день — текст", "завтрашнее дело" in last_text(), last_text()[:200])
+        check("календарь: назад", any("ncal_m_" in b.callback_data for row in (getattr(last_method(), "reply_markup", None).inline_keyboard) for b in row))
+        # кнопки элементов дня
+        kb_day = getattr(last_method(), "reply_markup", None)
+        day_cbs = [b.callback_data for row in (kb_day.inline_keyboard if kb_day else []) for b in row]
+        rem_cb = next((c for c in day_cbs if c.startswith("ncal_i_r_")), None)
+        check("календарь: кнопка напоминания", rem_cb is not None, str(day_cbs[:12]))
+        if rem_cb:
+            await feed(cb_update(rem_cb, 401))
+            check("календарь: открытие напоминания", "напоминание #" in last_text().lower(), last_text()[:120])
+            check("календарь: кнопка К дню", any("ncal_d_" in b.callback_data for row in (getattr(last_method(), "reply_markup", None).inline_keyboard) for b in row))
+            back = next((b.callback_data for row in getattr(last_method(), "reply_markup", None).inline_keyboard for b in row if b.callback_data.startswith("ncal_d_")), None)
+            if back:
+                await feed(cb_update(back, 402))
+                check("календарь: возврат в день", "напоминания" in last_text().lower() and "завтрашнее дело" in last_text(), last_text()[:100])
+        # заметки дня (есть фикстуры с сегодняшней/любой датой — ищем ncal_i_n_)
+        note_cb = next((c for c in day_cbs if c.startswith("ncal_i_n_")), None)
+        if note_cb:
+            await feed(cb_update(note_cb, 403))
+            check("календарь: открытие заметки", "заметк" in last_text().lower() or len(last_text()) > 40, last_text()[:80])
+            check("календарь: заметка — удалить", any("ncal_dn:" in b.callback_data for row in (getattr(last_method(), "reply_markup", None).inline_keyboard) for b in row))
+
+        # редактирование / удаление задачи
+        task_cb = next((c for c in day_cbs if c.startswith("ncal_i_t_")), None)
+        if task_cb:
+            await feed(cb_update(task_cb, 410))
+            check("календарь: карточка задачи", "задача" in last_text().lower(), last_text()[:80])
+            tkb = getattr(last_method(), "reply_markup", None)
+            tcbs = [b.callback_data for row in (tkb.inline_keyboard if tkb else []) for b in row]
+            check("задача: кнопки изм/удал", any(c.startswith("ncal_et_") for c in tcbs) and any(c.startswith("ncal_dt_") for c in tcbs), str(tcbs))
+            et = next((c for c in tcbs if c.startswith("ncal_et_")), None)
+            if et:
+                await feed(cb_update(et, 411))
+                check("задача: просьба текста", "новый текст" in last_text().lower(), last_text()[:80])
+                await feed(msg_update("совсем новый текст задачи"))
+                check("задача: текст применён", "обновлена" in last_text().lower(), last_text()[:80])
+            tid_part = task_cb.rsplit("_", 1)[1]
+            await feed(cb_update(f"ncal_dt_{tid_part}", 412))
+            check("задача: confirm", "удалить задачу" in last_text().lower(), last_text()[:80])
+            await feed(cb_update(f"ncal_dty_{tid_part}", 413))
+            check("задача: после удаления — день", "напоминания" in last_text().lower() or "календар" in last_text().lower(), last_text()[:80])
+
+    # 13. заголовки заметок — первые слова, не id
+    from app.bot import _note_title, _note_title_from_md
+    t = _note_title_from_md("# План запуска\n\n## Самое важное\n- пункт")
+    check("title: H1", t == "План запуска", t)
+    t2 = _note_title_from_md("Сегодня многое обсудил с командой по поводу релиза сроки")
+    check("title: первые слова", "Сегодня многое" in t2, t2)
+    files = B._list_notes(1)
+    if files:
+        tn = _note_title(files[0])
+        check("title: из файла без AgAD", "AgAD" not in tn and len(tn) >= 3, tn)
+        check("title: не голое note1", tn != "note1", tn)
+
+    # 14. правка/удаление задачи и заметки напрямую
+    tid = T.add_task(1, "старый текст для правки")
+    await feed(cb_update(f"ncal_et_{tid}", 420))
+    check("edit: просьба нового текста", "новый текст" in last_text().lower(), last_text()[:80])
+    await feed(msg_update("обновлённый текст v2"))
+    check(
+        "edit: успех",
+        any("обновлена" in t.lower() for t in sent_texts()[-3:]),
+        str(sent_texts()[-3:])[:200],
+    )
+    row = T.get_task(tid, 1)
+    check("edit: в БД", row is not None and "v2" in row["text"], str(row["text"] if row else None))
+    await feed(cb_update(f"ncal_dt_{tid}", 421))
+    check("del: confirm", "удалить задачу" in last_text().lower(), last_text()[:80])
+    await feed(cb_update(f"ncal_dty_{tid}", 422))
+    check("del: нет в БД", T.get_task(tid, 1) is None)
+    # заметка удаление
+    nfiles = B._list_notes(1)
+    if nfiles:
+        base = os.path.basename(nfiles[0])
+        n_before = len(B._list_notes(1))
+        await feed(cb_update(f"ncal_dn:{base}", 423))
+        check("del note: confirm", "удалить заметку" in last_text().lower(), last_text()[:100])
+        await feed(cb_update(f"ncal_dny:{base}", 424))
+        check("del note: файла нет", len(B._list_notes(1)) == n_before - 1, str(len(B._list_notes(1))))
+
+    # 15. /users — только владелец (ALLOWED=1 в тесте)
+    await feed(msg_update("/users"))
+    check("/users: заголовок", "заходили" in last_text().lower() or "пока никто" in last_text().lower(), last_text()[:80])
+    # чужой — молчит
+    upd_u = Update.model_validate(
+        {"update_id": 500, "message": {"message_id": 500, "date": "2026-10-19T12:00:00",
+         "from": {"id": 999, "is_bot": False, "first_name": "Чужой"}, "chat": {"id": 999, "type": "private"}, "text": "/users"}},
+        context={"bot": mock_bot},
+    )
+    n_u = len(sent_texts())
+    await feed(upd_u)
+    check("/users: чужой игнорируется", len(sent_texts()) == n_u, f"{n_u}->{len(sent_texts())}")
 
     # итог
     fails = [r for r in results if not r[1]]

@@ -1,32 +1,41 @@
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-DB_PATH = os.environ.get("REMINDERS_DB", "reminders.db")
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("REMINDERS_DB", os.path.join(_BASE, "reminders.db"))
 
 # правила повтора: daily | weekdays | weekly:<0-6 (пн=0)> | monthly:<день 1-31>
 WEEKDAY_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS reminders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            due_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        )"""
-    )
-    # миграция: колонка повтора (безопасно, если уже есть)
+@contextmanager
+def _connect():
+    """with _connect() as conn: — закрывает соединение (иначе утечка FD)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
-        conn.execute("ALTER TABLE reminders ADD COLUMN repeat_rule TEXT")
-    except sqlite3.OperationalError:
-        pass
-    return conn
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        try:
+            conn.execute("ALTER TABLE reminders ADD COLUMN repeat_rule TEXT")
+        except sqlite3.OperationalError:
+            pass
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_reminder(chat_id: int, text: str, due_utc: datetime, repeat_rule: str | None = None) -> int:
@@ -83,6 +92,26 @@ def list_pending(chat_id: int) -> list[sqlite3.Row]:
             "SELECT * FROM reminders WHERE chat_id = ? AND status = 'pending' ORDER BY due_at",
             (chat_id,),
         ).fetchall()
+
+
+def get_reminder(reminder_id: int, chat_id: int):
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM reminders WHERE id = ? AND chat_id = ?",
+            (reminder_id, chat_id),
+        ).fetchone()
+
+
+def set_text(reminder_id: int, chat_id: int, text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE reminders SET text = ? WHERE id = ? AND chat_id = ?",
+            (text, reminder_id, chat_id),
+        )
+        return cur.rowcount > 0
 
 
 def cancel(reminder_id: int, chat_id: int) -> bool:

@@ -2,41 +2,106 @@
 import os
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.environ.get("MEMORY_DB", "memory.db")
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("MEMORY_DB", os.path.join(_BASE, "memory.db"))
 
 DIALOG_KEEP = 200  # сколько реплик храним на чат
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            fact TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'manual',
-            created_at TEXT NOT NULL
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS dialog (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            text TEXT NOT NULL,
-            ts TEXT NOT NULL
-        )"""
-    )
-    conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(path UNINDEXED, body)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS notes_files (path TEXT PRIMARY KEY, mtime REAL NOT NULL)"
-    )
-    return conn
+@contextmanager
+def _connect():
+    """with _connect() as conn: — закрывает соединение (иначе утечка FD)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                fact TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS dialog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                ts TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(path UNINDEXED, body)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notes_files (path TEXT PRIMARY KEY, mtime REAL NOT NULL)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )"""
+        )
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- пользователи (кто заходил в бота) ----------
+
+def upsert_user(
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO users (user_id, username, first_name, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username = COALESCE(NULLIF(excluded.username, ''), users.username),
+                 first_name = COALESCE(NULLIF(excluded.first_name, ''), users.first_name),
+                 last_seen = excluded.last_seen""",
+            (int(user_id), username or "", first_name or "", now, now),
+        )
+
+
+def list_users(limit: int = 50) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM users ORDER BY last_seen DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+
+def import_users_from_dialog() -> int:
+    """Дозаписать chat_id из истории диалога (исторические сессии до таблицы users)."""
+    now = datetime.now(timezone.utc).isoformat()
+    n = 0
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT chat_id FROM dialog WHERE chat_id NOT IN (SELECT user_id FROM users)"
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, first_name, first_seen, last_seen) "
+                "VALUES (?, '', '', ?, ?)",
+                (r["chat_id"], now, now),
+            )
+            n += 1
+    return n
 
 
 # ---------- факты ----------
@@ -163,8 +228,10 @@ def _fts_query(query: str) -> str:
 
 
 def search_notes(notes_dir: str, query: str, limit: int = 4) -> list[dict]:
-    """Поиск по заметкам: FTS5, при пустом результате — LIKE-фолбэк."""
+    """Поиск по заметкам: FTS5, при пустом результате — LIKE-фолбэк.
+    Фильтрует по префиксу notes_dir — чужие папки не попадают."""
     sync_notes(notes_dir)
+    prefix = notes_dir.rstrip("/") + "/"
     q = _fts_query(query)
     rows: list[sqlite3.Row] = []
     if q:
@@ -172,8 +239,9 @@ def search_notes(notes_dir: str, query: str, limit: int = 4) -> list[dict]:
             try:
                 rows = conn.execute(
                     "SELECT path, snippet(notes_fts, 1, '', ' … ', '', 24) AS snip "
-                    "FROM notes_fts WHERE notes_fts MATCH ? LIMIT ?",
-                    (q, limit),
+                    "FROM notes_fts WHERE notes_fts MATCH ? AND substr(path, 1, length(?)) = ? "
+                    "LIMIT ?",
+                    (q, prefix, prefix, limit),
                 ).fetchall()
             except sqlite3.OperationalError:
                 rows = []
@@ -183,8 +251,8 @@ def search_notes(notes_dir: str, query: str, limit: int = 4) -> list[dict]:
             with _connect() as conn:
                 rows = conn.execute(
                     "SELECT path, substr(body, 1, 300) AS snip FROM notes_fts "
-                    "WHERE lower(body) LIKE ? LIMIT ?",
-                    (f"%{token}%", limit),
+                    "WHERE lower(body) LIKE ? AND substr(path, 1, length(?)) = ? LIMIT ?",
+                    (f"%{token}%", prefix, prefix, limit),
                 ).fetchall()
     out = []
     for r in rows:

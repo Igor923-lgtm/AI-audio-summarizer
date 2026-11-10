@@ -1,21 +1,31 @@
 """Простые настройки per-chat (sqlite kv)."""
 import os
 import sqlite3
+from contextlib import contextmanager
 
-DB_PATH = os.environ.get("KV_DB", "kv.db")
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("KV_DB", os.path.join(_BASE, "kv.db"))
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS kv (
-            chat_id INTEGER NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY (chat_id, key)
-        )"""
-    )
-    return conn
+@contextmanager
+def _connect():
+    """with _connect() as conn: — закрывает соединение (иначе утечка FD)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS kv (
+                chat_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (chat_id, key)
+            )"""
+        )
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get(chat_id: int, key: str, default: str | None = None) -> str | None:

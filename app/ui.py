@@ -31,7 +31,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="📝 Заметки"), KeyboardButton(text="⏰ Напоминания")],
         [KeyboardButton(text="✅ Задачи"), KeyboardButton(text="💸 Финансы")],
-        [KeyboardButton(text="⚙️ Помощь")],
+        [KeyboardButton(text="📅 Календарь"), KeyboardButton(text="⚙️ Помощь")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
